@@ -142,7 +142,7 @@ class Beatmap:
                  'last_update', 'total_length', 'max_combo',
                  'status', 'frozen', 'plays', 'passes',
                  'mode', 'bpm', 'cs', 'od', 'ar', 'hp',
-                 'diff', 'pp_cache')
+                 'diff', 'last_check', 'pp_cache')
 
     def __init__(self, **kwargs):
         self.md5 = kwargs.get('md5', '')
@@ -172,6 +172,7 @@ class Beatmap:
         self.hp = kwargs.get('hp', 0.0)
 
         self.diff = kwargs.get('diff', 0.00)
+        self.last_check = kwargs.get('last_check', int(time.time()))
         self.pp_cache = {0: {}, 1: {}, 2: {}, 3: {}} # {mode_vn: {mods: (acc/score: pp, ...), ...}}
 
     @property
@@ -240,7 +241,7 @@ class Beatmap:
             'last_update, total_length, max_combo, '
             'status, frozen, plays, passes, '
             'mode, bpm, cs, od, ar, hp, '
-            'diff '
+            'diff, last_check '
             'FROM maps WHERE id = %s',
             [bid]
         ):
@@ -304,7 +305,7 @@ class Beatmap:
             'last_update, total_length, max_combo, '
             'status, frozen, plays, passes, '
             'mode, bpm, cs, od, ar, hp, '
-            'diff '
+            'diff, last_check '
             'FROM maps WHERE md5 = %s',
             [md5]
         ):
@@ -354,6 +355,7 @@ class Beatmap:
         m.hp = float(bmap['diff_drain'])
 
         m.diff = float(bmap['difficultyrating'])
+        m.last_check = int(time.time())
 
         res = await glob.db.fetch(
             'SELECT last_update, status, frozen '
@@ -495,6 +497,88 @@ class Beatmap:
             if glob.app.debug:
                 log(f'Retrieved {m.full} from the osu!api.', Ansi.LMAGENTA)
 
+    async def update_status(self, md5: str):
+        """Update map status from osu!api if there is update available."""
+        set_id = (await glob.db.fetch(
+            'SELECT set_id '
+            'FROM maps WHERE md5 = %s',
+            [md5]
+        ))['set_id']
+        url = 'https://old.ppy.sh/api/get_beatmaps'
+        params = {'k': glob.config.osu_api_key, 's': set_id}
+
+        async with glob.http.get(url, params=params) as resp:
+            if not resp or resp.status != 200:
+                return # osu!api request failed.
+
+            # we want all maps returned, so get full json
+            if not (apidata := await resp.json()):
+                return
+
+        res = await glob.db.fetchall(
+            'SELECT id, status, frozen '
+            'FROM maps WHERE set_id = %s',
+            [set_id], _dict=True
+        )
+
+        # get a tuple of the ones we
+        # currently have in our database.
+        current_data = {r['id']: {k: r[k] for k in set(r) - {'id'}}
+                        for r in res}
+
+        for bmap in apidata:
+            map_id = int(bmap['beatmap_id'])
+            # check if we have data in db
+            if map_id in current_data:
+                if(
+                    (current_status := RankedStatus(current_data[map_id]['status'])) !=
+                    (api_status := RankedStatus.from_osuapi(int(bmap['approved'])))
+                ):
+                    # check if our map not frozen
+                    # and able to change their status
+                    if not current_data[map_id]['frozen']:
+                        api_md5 = bmap['file_md5']
+                        # update our map
+                        if api_md5 == md5:
+                            self.status = api_status
+                        # set scores status on that map to failed for now
+                        for table in ('scores_vn', 'scores_rx', 'scores_ap'):
+                            await glob.db.execute(f'UPDATE {table} SET status = 0 WHERE map_md5 = %s', [api_md5])
+                        # update map status in db
+                        await glob.db.execute('UPDATE maps SET status = %s WHERE id = %s', [api_status, map_id])
+                        # update status in beatmap cache;
+                        # check if our map in cache
+                        if api_md5 in glob.cache['beatmap']:
+                            cached = glob.cache['beatmap'][api_md5]
+                            # if cache timeout, just delete this
+                            if (time.time() - cached['timeout']) <= 0:
+                                # cache is within timeout.
+                                cached['map'].status = api_status
+                            else:
+                                del glob.cache['beatmap'][api_md5]
+
+                        if glob.app.debug:
+                            log(f"Updated map {bmap['artist']} - {bmap['title']} [{bmap['version']}] from {current_status!s} to {api_status!s}", Ansi.GREEN)
+                else:
+                    # update our last_check in db
+                    await glob.db.execute('UPDATE maps SET last_check = %s WHERE set_id = %s', [int(time.time()), set_id])
+                    # return nothing cuz map
+                    # doesn't need to update
+                    return # Howdy 🤠
+            else:
+                # for some reason we not found
+                # current data in db; pass it
+                # XXX: Probably it is not submitted
+                # maps are trying to update status
+                pass
+
+        # update our last_check in db
+        # we always need to update it
+        # when function is executed
+        await glob.db.execute('UPDATE maps SET last_check = %s WHERE set_id = %s', [int(time.time()), set_id])
+        # return bmap 👌
+        return self
+
     async def cache_pp(self, mods: Mods) -> None:
         """Cache some common acc pp values for specified mods."""
         mode_vn = self.mode.as_vanilla
@@ -528,20 +612,20 @@ class Beatmap:
                 'artist, title, version, creator, '
                 'last_update, total_length, max_combo, '
                 'status, frozen, plays, passes, '
-                'mode, bpm, cs, od, ar, hp, diff'
+                'mode, bpm, cs, od, ar, hp, diff, last_check'
             ') VALUES ('
                 '"osu!", %s, %s, %s, '
                 '%s, %s, %s, %s, '
                 '%s, %s, %s, '
                 '%s, %s, %s, %s, '
                 '%s, %s, %s, %s, '
-                '%s, %s, %s'
+                '%s, %s, %s, %s'
             ')', [
                 self.md5, self.id, self.set_id,
                 self.artist, self.title, self.version, self.creator,
                 self.last_update, self.total_length, self.max_combo,
                 self.status, self.frozen, self.plays, self.passes,
                 self.mode, self.bpm, self.cs, self.od,
-                self.ar, self.hp, self.diff
+                self.ar, self.hp, self.diff, self.last_check
             ]
         )
